@@ -1,6 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import {
   createAgentPlugin,
   type AgentFetchContext,
@@ -8,9 +6,10 @@ import {
   type SessionParseOptions,
   type SessionUsageData,
 } from '@tokentop/plugin-sdk';
-
-// TODO: Implement session parsing for Cursor
-// See @tokentop/agent-opencode for a complete reference implementation.
+import { CACHE_TTL_MS, SESSION_AGGREGATE_CACHE_MAX, composerMetadataIndex, sessionAggregateCache, sessionCache } from './cache.ts';
+import { parseSessionsFromWorkspaces } from './parser.ts';
+import { CURSOR_GLOBAL_STORAGE_PATH, CURSOR_HOME, CURSOR_STATE_DB_PATH, CURSOR_WORKSPACE_STORAGE_PATH } from './paths.ts';
+import { RECONCILIATION_INTERVAL_MS, startActivityWatch, stopActivityWatch } from './watcher.ts';
 
 const cursorAgentPlugin = createAgentPlugin({
   id: 'cursor',
@@ -26,31 +25,52 @@ const cursorAgentPlugin = createAgentPlugin({
   permissions: {
     filesystem: {
       read: true,
-      paths: ['~/.cursor'],
+      paths: ['~/.cursor', '~/Library/Application Support/Cursor', '~/.config/Cursor'],
     },
   },
 
   agent: {
     name: 'Cursor',
     command: 'cursor',
-    configPath: path.join(os.homedir(), '.cursor'),
-    sessionPath: path.join(os.homedir(), '.cursor'),
+    configPath: CURSOR_HOME,
+    sessionPath: CURSOR_GLOBAL_STORAGE_PATH,
   },
 
   capabilities: {
-    sessionParsing: false,
+    sessionParsing: true,
     authReading: false,
-    realTimeTracking: false,
+    realTimeTracking: true,
     multiProvider: false,
   },
 
-  async isInstalled(_ctx: PluginContext): Promise<boolean> {
-    return fs.existsSync(path.join(os.homedir(), '.cursor'));
+  startActivityWatch(_ctx: PluginContext, callback): void {
+    startActivityWatch(callback);
   },
 
-  async parseSessions(_options: SessionParseOptions, _ctx: AgentFetchContext): Promise<SessionUsageData[]> {
-    return [];
+  stopActivityWatch(_ctx: PluginContext): void {
+    stopActivityWatch();
+  },
+
+  async isInstalled(_ctx: PluginContext): Promise<boolean> {
+    return fs.existsSync(CURSOR_STATE_DB_PATH) || fs.existsSync(CURSOR_HOME);
+  },
+
+  async parseSessions(options: SessionParseOptions, ctx: AgentFetchContext): Promise<SessionUsageData[]> {
+    return parseSessionsFromWorkspaces(options, ctx);
   },
 });
+
+export {
+  CACHE_TTL_MS,
+  CURSOR_GLOBAL_STORAGE_PATH,
+  CURSOR_HOME,
+  CURSOR_STATE_DB_PATH,
+  CURSOR_WORKSPACE_STORAGE_PATH,
+  RECONCILIATION_INTERVAL_MS,
+  SESSION_AGGREGATE_CACHE_MAX,
+  composerMetadataIndex,
+  sessionAggregateCache,
+  sessionCache,
+};
 
 export default cursorAgentPlugin;
