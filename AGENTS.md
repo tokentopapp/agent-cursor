@@ -31,25 +31,30 @@ CI runs `bun run build` then `bun run typecheck`. Both must pass.
 
 | File | Responsibility |
 |------|----------------|
-| `src/index.ts` | Plugin entry point — `createAgentPlugin()` wiring (`isInstalled`, `parseSessions`, `startActivityWatch`, `stopActivityWatch`), re-exports public API constants and cache objects |
-| `src/parser.ts` | Session parsing — reads Cursor's SQLite `state.vscdb`, iterates composers and bubbles, builds workspace-to-composer mapping, returns normalized `SessionUsageData[]` with caching |
-| `src/watcher.ts` | File watching — `sessionWatcher` marks dirty on DB changes for incremental parsing, `activityWatcher` tracks known bubbles and emits real-time `ActivityUpdate` deltas, periodic full reconciliation |
+| `src/index.ts` | Plugin entry point — `createAgentPlugin()` wiring (`isInstalled`, `parseSessions`, `startActivityWatch`, `stopActivityWatch`), config schema, re-exports public API constants and cache objects |
+| `src/parser.ts` | Session parsing — reads Cursor's SQLite `state.vscdb`, iterates composers and bubbles, builds workspace-to-composer mapping, estimates tokens from text, returns normalized `SessionUsageData[]` with caching |
+| `src/watcher.ts` | Activity detection — `sessionWatcher` marks dirty on DB/WAL changes for incremental parsing, `activityWatcher` uses rowid-based cursor with read-write DB connection for real-time `ActivityUpdate` deltas, pending bubble re-checks during streaming, periodic full reconciliation |
+| `src/csv.ts` | Server enrichment — fetches Cursor's CSV usage export (`/api/dashboard/export-usage-events-csv`), parses rows, matches to sessions by timestamp (±60s window), caches enriched data in `sessionEnrichmentCache` with persistent hydration via PluginStorage |
+| `src/auth.ts` | Authentication — JWT decode (base64url), session cookie construction (`WorkosCursorSessionToken`) from `cursorAuth/accessToken` in SQLite |
+| `src/storage.ts` | Persistence — `setPluginStorage()`/`getPluginStorage()` bridge for enrichment cache hydration across app restarts |
 | `src/cache.ts` | Caching — TTL-based session cache (2s), per-composer aggregate cache with LRU eviction (10K max), composer metadata index for change detection |
 | `src/paths.ts` | Path resolution — cross-platform Cursor config/data directories (macOS, Linux, Windows), workspace directory listing |
-| `src/types.ts` | Type definitions — Cursor-specific interfaces for composers, bubbles, token counts, model config, workspace metadata, cache entries |
-| `src/utils.ts` | SQLite helpers — `openDatabase`, KV reads (`composerData:*`, `bubbleId:*`), workspace composer index, `resolveProviderId` (model-name-to-provider mapping), URI parsing |
+| `src/types.ts` | Type definitions — Cursor-specific interfaces for composers, bubbles, token counts, model config, workspace metadata, cache entries, CSV usage rows |
+| `src/utils.ts` | SQLite helpers — `openDatabase` (readonly for parser), `openDatabaseForWatcher` (readwrite for WAL visibility), KV reads (`composerData:*`, `bubbleId:*`), workspace composer index, `resolveProviderId` (model-name-to-provider mapping), URI parsing |
 
 ## Architecture Notes
 
-- **SQLite-based parsing**: Cursor stores sessions as "composers" in a SQLite KV table (`cursorDiskKV` in `state.vscdb` at `<UserData>/globalStorage/`). Composers are keyed as `composerData:{composerId}`, individual messages (bubbles) as `bubbleId:{composerId}:{bubbleId}`. Only assistant bubbles (type 2) with non-zero `inputTokens` are considered token-bearing.
+- **SQLite-based parsing**: Cursor stores sessions as "composers" in a SQLite KV table (`cursorDiskKV` in `state.vscdb` at `<UserData>/globalStorage/`). Composers are keyed as `composerData:{composerId}`, individual messages (bubbles) as `bubbleId:{composerId}:{bubbleId}`. Assistant bubbles (type 2) with either non-zero token counts or non-empty text content are tracked.
+- **Token estimation**: Cursor populates `tokenCount` asynchronously via server polling (`getTokenUsage`). When the server doesn't return a `usageUuid` (common in agent-mode), `tokenCount` stays at zero. The plugin estimates output tokens from response text (`text.length / 4`) as a fallback.
+- **Hybrid enrichment**: Sessions appear immediately with local estimates, then get backfilled with accurate data from Cursor's CSV server export. The CSV fetch is awaited on stale/empty cache so enrichment lands on the same `parseSessions` cycle. Enriched data is cached in `sessionEnrichmentCache` (in-memory) and persisted to `PluginStorage` for cross-restart survival.
 - **Workspace mapping**: Composer-to-project mapping is resolved via workspace storage directories (`<UserData>/workspaceStorage/`). Each workspace has its own `state.vscdb` with an `ItemTable` entry at `composer.composerData` listing composer IDs. The workspace's `workspace.json` provides the project folder URI.
 - **Two-layer caching**: `sessionCache` (TTL-based full result cache, 2s TTL) + `sessionAggregateCache` (per-composer parsed rows, LRU eviction at 10K entries)
-- **Dirty tracking**: `fs.watch` on `state.vscdb` sets a dirty flag; only dirty or new composers get re-parsed. A composer metadata index tracks `lastUpdatedAt` per composer to skip unchanged entries.
+- **Dirty tracking**: `fs.watch` on both `state.vscdb` and `state.vscdb-wal` sets a dirty flag; only dirty or new composers get re-parsed. A composer metadata index tracks `lastUpdatedAt` per composer to skip unchanged entries. Empty cached results are always re-checked.
 - **Reconciliation**: Full stat sweep forced every 10 minutes via interval timer, bypassing dirty/metadata checks
-- **Activity watching**: Primes a set of known `composerId:bubbleId` keys on start. On DB change, scans all composers for new bubble keys not in the known set. New token-bearing bubbles fire `ActivityCallback` with delta tokens.
+- **Activity watching**: Rowid-based cursor on `cursorDiskKV` detects new bubble INSERTs. Uses `openDatabaseForWatcher()` (read-write mode) to avoid bun:sqlite WAL snapshot isolation. Pending bubbles (empty assistant messages during streaming) are re-checked at 500ms until content appears. Base poll interval is 1s with 150ms debounce on `fs.watch` events.
+- **Auth for CSV**: Access token read from `cursorAuth/accessToken` in `ItemTable`. JWT `sub` field provides the userId. Cookie format: `WorkosCursorSessionToken=${userId}%3A%3A${accessToken}`.
 - **Deduplication**: Uses `bubbleId` as dedup key within each composer via `Map<string, SessionUsageData>`
 - **Model-to-provider mapping**: `resolveProviderId()` maps model name prefixes to provider IDs (`claude*` → `anthropic`, `gpt*/o1*/o3*/o4*` → `openai`, `gemini*` → `google`, `deepseek*` → `deepseek`, fallback → `cursor`). Per-bubble model info is preferred over composer-level model config; unresolved models fall back to `cursor-default`.
-
 ## TypeScript Configuration
 
 - **Strict mode**: `strict: true` — all strict checks enabled
