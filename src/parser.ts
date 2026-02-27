@@ -134,6 +134,7 @@ export function parseComposerBubbles(
         output: outputTokens,
       },
       timestamp,
+      metadata: { isEstimated: true },
       sessionUpdatedAt: meta.lastUpdatedAt,
     };
 

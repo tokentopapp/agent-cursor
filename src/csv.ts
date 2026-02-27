@@ -269,6 +269,7 @@ export async function enrichWithCsvData(
         ...(cacheWrite > 0 ? { cacheWrite: Math.round(cacheWrite * weight) } : {}),
       },
       ...(csv.cost > 0 ? { cost: Number((csv.cost * weight).toFixed(6)) } : {}),
+      metadata: { isEstimated: false },
     };
   });
 
@@ -323,6 +324,7 @@ function applyCachedEnrichmentToRow(row: SessionUsageData): SessionUsageData | n
     ...row,
     tokens: match.tokens,
     ...(match.cost !== undefined ? { cost: match.cost } : {}),
+    metadata: { isEstimated: false },
   };
 }
 
