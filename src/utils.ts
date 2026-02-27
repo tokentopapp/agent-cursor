@@ -16,6 +16,20 @@ export function openDatabase(dbPath: string): Database | null {
   }
 }
 
+/**
+ * Open a database WITHOUT readonly mode. Used by the activity watcher to
+ * avoid WAL snapshot isolation — bun:sqlite in readonly mode may not see
+ * rows that exist only in the WAL file (not yet checkpointed).
+ * Read-write connections in WAL mode always read the latest WAL state.
+ */
+export function openDatabaseForWatcher(dbPath: string): Database | null {
+  try {
+    return new Database(dbPath, { readwrite: true, create: false });
+  } catch {
+    return null;
+  }
+}
+
 export function readComposerData(db: Database, composerId: string): CursorComposerData | null {
   try {
     const row = db.query('SELECT value FROM cursorDiskKV WHERE key = ?').get(`composerData:${composerId}`) as { value: string } | null;

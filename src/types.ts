@@ -55,6 +55,11 @@ export interface CursorComposerData {
 /**
  * Individual bubble (message) from cursorDiskKV `bubbleId:{composerId}:{bubbleId}`.
  * Only the fields we need for token extraction are typed here.
+ *
+ * Note: Cursor populates tokenCount asynchronously by polling its server via
+ * getTokenUsage({usageUuid}). When the server doesn't return a usageUuid (common
+ * in newer agent-mode conversations), tokenCount remains {inputTokens:0, outputTokens:0}.
+ * In that case we estimate output tokens from the bubble's text content.
  */
 export interface CursorBubbleData {
   _v: number;
@@ -65,6 +70,10 @@ export interface CursorBubbleData {
   requestId: string;
   createdAt: string;
   isAgentic?: boolean;
+  /** The assistant's response text content. Used for token estimation when tokenCount is zero. */
+  text?: string;
+  /** Server-assigned UUID for fetching token usage. Absent in newer agent-mode conversations. */
+  usageUuid?: string;
 }
 
 /** Composer entry in the workspace-level `composer.composerData` list. */
@@ -107,4 +116,18 @@ export interface SessionAggregateCacheEntry {
   updatedAt: number;
   usageRows: SessionUsageData[];
   lastAccessed: number;
+}
+
+/** A single row from Cursor's CSV usage export (`/api/dashboard/export-usage-events-csv`). */
+export interface CursorCsvUsageRow {
+  timestamp: number;
+  kind: string;
+  model: string;
+  maxMode: boolean;
+  inputTokensWithCacheWrite: number;
+  inputTokensWithoutCacheWrite: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cost: number;
 }

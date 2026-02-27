@@ -22,8 +22,16 @@ import {
   resolveProviderId,
 } from './utils.ts';
 import { consumeForceFullReconciliation, sessionWatcher, startSessionWatcher } from './watcher.ts';
+import { enrichWithCsvData, getCsvRows } from './csv.ts';
 
 const ASSISTANT_BUBBLE_TYPE = 2;
+
+/**
+ * Approximate characters-per-token ratio for estimating output tokens from
+ * response text when Cursor's async token count polling returns zeros.
+ * Conservative at 4 chars/token (standard for mixed English/markdown).
+ */
+const ESTIMATED_CHARS_PER_TOKEN = 4;
 
 interface ComposerWithMeta {
   composerId: string;
@@ -38,17 +46,45 @@ export function toTimestamp(isoString: string | undefined, fallback: number): nu
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-export function isTokenBearingBubble(bubble: unknown): bubble is CursorBubbleData {
+/**
+ * Validates that a bubble is an assistant response worth tracking.
+ *
+ * Cursor populates tokenCount asynchronously via server polling (getTokenUsage).
+ * In newer agent-mode conversations the server often doesn't provide a usageUuid,
+ * leaving tokenCount at {inputTokens:0, outputTokens:0}. We accept assistant
+ * bubbles with either real token counts OR non-empty text content (for estimation).
+ */
+export function isAssistantBubble(bubble: unknown): bubble is CursorBubbleData {
   if (!bubble || typeof bubble !== 'object') return false;
 
   const candidate = bubble as Partial<CursorBubbleData>;
   if (candidate.type !== ASSISTANT_BUBBLE_TYPE) return false;
-  if (!candidate.tokenCount || typeof candidate.tokenCount !== 'object') return false;
-  if (typeof candidate.tokenCount.inputTokens !== 'number' || candidate.tokenCount.inputTokens <= 0) return false;
-  if (typeof candidate.tokenCount.outputTokens !== 'number') return false;
   if (typeof candidate.bubbleId !== 'string' || candidate.bubbleId.length === 0) return false;
 
-  return true;
+  const hasTokens =
+    candidate.tokenCount &&
+    typeof candidate.tokenCount === 'object' &&
+    typeof candidate.tokenCount.inputTokens === 'number' &&
+    typeof candidate.tokenCount.outputTokens === 'number';
+
+  const hasText = typeof candidate.text === 'string' && candidate.text.length > 0;
+
+  return hasTokens || hasText;
+}
+
+/**
+ * @deprecated Use {@link isAssistantBubble} instead.
+ */
+export const isTokenBearingBubble = isAssistantBubble;
+
+/**
+ * Estimates output token count from response text length.
+ * Returns 0 when text is empty/missing. Used as fallback when Cursor's
+ * async token polling didn't populate the actual counts.
+ */
+export function estimateOutputTokens(text: string | undefined): number {
+  if (!text || text.length === 0) return 0;
+  return Math.ceil(text.length / ESTIMATED_CHARS_PER_TOKEN);
 }
 
 function resolveModelName(bubble: CursorBubbleData, composer: CursorComposerData): string {
@@ -69,25 +105,33 @@ export function parseComposerBubbles(
   db: Database,
   meta: ComposerWithMeta,
   composer: CursorComposerData,
+  shouldEstimate = true,
 ): SessionUsageData[] {
   const deduped = new Map<string, SessionUsageData>();
   const bubbleIds = readAllBubbleKeys(db, meta.composerId);
 
   for (const bubbleId of bubbleIds) {
     const bubble = readBubbleData(db, meta.composerId, bubbleId);
-    if (!isTokenBearingBubble(bubble)) continue;
+    if (!isAssistantBubble(bubble)) continue;
 
     const modelId = resolveModelName(bubble, composer);
     const providerId = resolveProviderId(modelId);
     const timestamp = toTimestamp(bubble.createdAt, meta.lastUpdatedAt);
+
+    const hasRealTokens = bubble.tokenCount.inputTokens > 0 || bubble.tokenCount.outputTokens > 0;
+    const outputTokens = hasRealTokens ? bubble.tokenCount.outputTokens : (shouldEstimate ? estimateOutputTokens(bubble.text) : 0);
+    const inputTokens = hasRealTokens ? bubble.tokenCount.inputTokens : 0;
+
+    // Skip bubbles with no real tokens and no text to estimate from
+    if (inputTokens === 0 && outputTokens === 0) continue;
 
     const usage: SessionUsageData = {
       sessionId: meta.composerId,
       providerId,
       modelId,
       tokens: {
-        input: bubble.tokenCount.inputTokens,
-        output: bubble.tokenCount.outputTokens,
+        input: inputTokens,
+        output: outputTokens,
       },
       timestamp,
       sessionUpdatedAt: meta.lastUpdatedAt,
@@ -102,7 +146,6 @@ export function parseComposerBubbles(
 
     deduped.set(bubble.bubbleId, usage);
   }
-
   return Array.from(deduped.values());
 }
 
@@ -166,6 +209,11 @@ export async function parseSessionsFromWorkspaces(
 
   const isDirty = sessionWatcher.dirty;
   sessionWatcher.dirty = false;
+
+  // Note: We no longer invalidate the CSV cache on dirty. The per-session
+  // enrichment cache in csv.ts ensures previously-enriched sessions retain
+  // their accurate data. The CSV cache expires naturally via TTL, and on
+  // refresh the enrichment cache gets updated with the latest totals.
 
   const needsFullStat = consumeForceFullReconciliation();
   if (needsFullStat) {
@@ -240,7 +288,14 @@ export async function parseSessionsFromWorkspaces(
 
     for (const meta of composers) {
       const cached = sessionAggregateCache.get(meta.composerId);
-      if (cached && cached.updatedAt === meta.lastUpdatedAt) {
+      // Bypass aggregate cache when DB is dirty, during reconciliation, or
+      // when the cached entry has no usage rows. Cursor may add/update bubbles
+      // without changing composerData.lastUpdatedAt, so the cache key (updatedAt)
+      // matches but the content is stale. Empty cached results are always
+      // re-checked — the first parse may have run before bubbles were ready
+      // (e.g. streaming response in a new project).
+      const cacheStale = isDirty || needsFullStat || (cached !== undefined && cached.usageRows.length === 0);
+      if (!cacheStale && cached && cached.updatedAt === meta.lastUpdatedAt) {
         cached.lastAccessed = now;
         aggregateCacheHits++;
         sessions.push(...cached.usageRows);
@@ -252,7 +307,8 @@ export async function parseSessionsFromWorkspaces(
       const composerData = readComposerData(db, meta.composerId);
       if (!composerData) continue;
 
-      const usageRows = parseComposerBubbles(db, meta, composerData);
+      const shouldEstimate = ctx.config.estimateTokens !== false;
+      const usageRows = parseComposerBubbles(db, meta, composerData, shouldEstimate);
 
       sessionAggregateCache.set(meta.composerId, {
         updatedAt: meta.lastUpdatedAt,
@@ -265,15 +321,21 @@ export async function parseSessionsFromWorkspaces(
 
     evictSessionAggregateCache();
 
+    // Enrich with actual token data from Cursor's CSV API (non-blocking).
+    // First call awaits the CSV fetch so enrichment lands immediately.
+    // Subsequent calls return stale CSV while a background refresh runs.
+    const csvRows = await getCsvRows(ctx);
+    const enrichedSessions = await enrichWithCsvData(sessions, csvRows);
+
     if (!options.sessionId) {
       sessionCache.lastCheck = Date.now();
-      sessionCache.lastResult = sessions;
+      sessionCache.lastResult = enrichedSessions;
       sessionCache.lastLimit = limit;
       sessionCache.lastSince = since;
     }
 
     ctx.logger.debug('Cursor: parsed sessions', {
-      count: sessions.length,
+      count: enrichedSessions.length,
       composers: composers.length,
       statChecks: statCount,
       statSkips: statSkipCount,
@@ -281,9 +343,10 @@ export async function parseSessionsFromWorkspaces(
       aggregateCacheMisses,
       metadataIndexSize: composerMetadataIndex.size,
       aggregateCacheSize: sessionAggregateCache.size,
+      csvEnriched: csvRows.length > 0,
     });
 
-    return sessions;
+    return enrichedSessions;
   } finally {
     db.close();
   }
