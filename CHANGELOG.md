@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/tokentopapp/agent-cursor/compare/v1.1.0...v1.2.0) (2026-02-28)
+
+
+### Features
+
+* set metadata.isEstimated on sessions awaiting CSV enrichment ([742017d](https://github.com/tokentopapp/agent-cursor/commit/742017d2b79183938589ed5d4358c9b6a1ebb906))
+
+
+### Bug Fixes
+
+* add bootstrap-sha to prevent stale changelog entries ([0959283](https://github.com/tokentopapp/agent-cursor/commit/0959283736b45cbfb0397bafee5dbb5fe1937f2e))
+
 ## [1.1.0](https://github.com/tokentopapp/agent-cursor/compare/v1.0.0...v1.1.0) (2026-02-27)
 
 
